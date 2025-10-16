@@ -8,66 +8,80 @@ import uuid
 from jsonschema import validate, ValidationError
 import os
 
-# ----------------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------------------
-# Exceptions
-# ----------------------------------------------------------------------------
 class EDIFACTBaseError(Exception):
-    """Base class for EDIFACT errors."""
-
+    pass
 
 class EDIFACTValidationError(EDIFACTBaseError):
-    """Raised when JSON or field validation fails."""
-
+    pass
 
 class EDIFACTGenerationError(EDIFACTBaseError):
-    """Raised when segment generation or ordering fails."""
+    pass
 
-
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
 class EDIFACTConfig:
-    SUPPORTED_CHARSETS = {"UNOA", "UNOB", "UTF-8"}
-    SUPPORTED_PAYMENT_METHODS = {"31", "42", "ZZZ"}
-    SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP"}
+    SUPPORTED_CHARSETS = {"UNOA", "UNOB", "UNOC"}
+    SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP", "JPY", "CAD"}
+    SUPPORTED_DATE_FORMATS = {"102", "203", "101"}
     MAX_PARTY_ID_LENGTH = 35
     MAX_NAME_LENGTH = 70
     MAX_ITEM_ID_LENGTH = 35
     MAX_TEXT_LENGTH = 350
 
-
-# ----------------------------------------------------------------------------
-# Validator
-# ----------------------------------------------------------------------------
 class EDIFACTValidator:
-    """Validation of input JSON against schema and EDIFACT rules."""
-
     JSON_SCHEMA = {
         "type": "object",
         "properties": {
             "charset": {"type": "string"},
-            "encoding": {"type": "string"},
             "invoice_number": {"type": "string"},
             "invoice_date": {"type": "string"},
             "currency": {"type": "string"},
+            "due_date": {"type": "string"},
+            "tax_rate": {"type": "number"},
             "parties": {
                 "type": "object",
                 "properties": {
-                    "buyer": {"type": "object"},
-                    "seller": {"type": "object"},
+                    "buyer": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "address": {"type": "string"},
+                            "contact": {"type": "string"}
+                        },
+                        "required": ["id"]
+                    },
+                    "seller": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "address": {"type": "string"},
+                            "contact": {"type": "string"}
+                        },
+                        "required": ["id"]
+                    }
                 },
-                "required": ["buyer", "seller"],
+                "required": ["buyer", "seller"]
             },
-            "items": {"type": "array"},
-            "payment_terms": {"type": "object"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "quantity": {"type": "number"},
+                        "price": {"type": "number"},
+                        "unit": {"type": "string"}
+                    },
+                    "required": ["id", "quantity", "price"]
+                }
+            },
+            "payment_terms": {"type": "string"}
         },
-        "required": ["invoice_number", "invoice_date", "currency", "parties", "items"],
+        "required": ["invoice_number", "invoice_date", "currency", "parties", "items"]
     }
 
     @classmethod
@@ -81,44 +95,61 @@ class EDIFACTValidator:
     def validate_fields(cls, data: Dict[str, Any]) -> None:
         if data.get("charset") and data["charset"] not in EDIFACTConfig.SUPPORTED_CHARSETS:
             raise EDIFACTValidationError(f"Unsupported charset: {data['charset']}")
-        if data.get("currency") not in EDIFACTConfig.SUPPORTED_CURRENCIES:
+        
+        if data["currency"] not in EDIFACTConfig.SUPPORTED_CURRENCIES:
             raise EDIFACTValidationError(f"Unsupported currency: {data['currency']}")
+        
+        cls._validate_date(data["invoice_date"], "invoice_date")
+        if data.get("due_date"):
+            cls._validate_date(data["due_date"], "due_date")
+        
         for party in ("buyer", "seller"):
             cls._validate_party(data["parties"][party], party)
-        for item in data["items"]:
-            cls._validate_item(item)
+        
+        for idx, item in enumerate(data["items"]):
+            cls._validate_item(item, idx)
+
+    @classmethod
+    def _validate_date(cls, date_str: str, field_name: str) -> None:
+        if not re.match(r"^\d{8}$", date_str):
+            raise EDIFACTValidationError(f"{field_name} must be in YYYYMMDD format")
+        try:
+            datetime.strptime(date_str, "%Y%m%d")
+        except ValueError:
+            raise EDIFACTValidationError(f"Invalid date in {field_name}: {date_str}")
 
     @classmethod
     def _validate_party(cls, party: Dict[str, Any], role: str) -> None:
-        if not re.match(r"^[A-Z0-9]+$", party.get("id", "")):
-            raise EDIFACTValidationError(f"{role} ID must be alphanumeric")
+        if not party.get("id"):
+            raise EDIFACTValidationError(f"{role} ID is required")
+        
         if len(party["id"]) > EDIFACTConfig.MAX_PARTY_ID_LENGTH:
-            raise EDIFACTValidationError(f"{role} ID too long")
+            raise EDIFACTValidationError(f"{role} ID too long: {len(party['id'])} > {EDIFACTConfig.MAX_PARTY_ID_LENGTH}")
+        
+        if party.get("name") and len(party["name"]) > EDIFACTConfig.MAX_NAME_LENGTH:
+            raise EDIFACTValidationError(f"{role} name too long")
 
     @classmethod
-    def _validate_item(cls, item: Dict[str, Any]) -> None:
-        if not item.get("id"):
-            raise EDIFACTValidationError("Item missing ID")
+    def _validate_item(cls, item: Dict[str, Any], index: int) -> None:
         if len(item["id"]) > EDIFACTConfig.MAX_ITEM_ID_LENGTH:
-            raise EDIFACTValidationError("Item ID too long")
+            raise EDIFACTValidationError(f"Item {index} ID too long")
+        
+        if item["quantity"] <= 0:
+            raise EDIFACTValidationError(f"Item {index} quantity must be positive")
+        
+        if item["price"] <= 0:
+            raise EDIFACTValidationError(f"Item {index} price must be positive")
 
-
-# ----------------------------------------------------------------------------
-# Generator
-# ----------------------------------------------------------------------------
 class EDIFACTGenerator:
-    """Generate EDIFACT INVOIC from validated JSON and save to file."""
-
     def __init__(self, data: Dict[str, Any], precision: int = 2, line_ending: str = "\n"):
         self.data = data
         self.precision = precision
         self.line_ending = line_ending
-        self.message_ref = data.get("message_ref") or str(uuid.uuid4().int)[:10]
+        self.message_ref = data.get("message_ref") or str(uuid.uuid4().int)[:14]
         self.segments: List[str] = []
 
     def _format_decimal(self, value: Any) -> str:
-        """Format decimal values consistently with precision and trailing zeros."""
-        d = Decimal(value).quantize(
+        d = Decimal(str(value)).quantize(
             Decimal(f"1.{'0'*self.precision}"), rounding=ROUND_HALF_UP
         )
         return f"{d:.{self.precision}f}"
@@ -126,11 +157,122 @@ class EDIFACTGenerator:
     def _escape_segment_value(self, value: Any) -> str:
         if value is None:
             return ""
-        return str(value).replace("?", "??").replace("+", "?+").replace(":", "?:").replace("'", "?'")
+        s = str(value)
+        s = s.replace("?", "??")
+        for char in ["'", "+", ":", "*"]:
+            s = s.replace(char, f"?{char}")
+        return s
 
     def _build_segment(self, tag: str, elements: List[Any]) -> str:
-        parts = [tag] + [self._escape_segment_value(e) for e in elements]
-        return "+".join(parts) + "'"
+        escaped_elements = [self._escape_segment_value(e) for e in elements]
+        return "+".join([tag] + escaped_elements) + "'"
+
+    def _add_una_segment(self) -> None:
+        self.segments.append("UNA:+.? '")
+
+    def _add_unb_segment(self) -> None:
+        timestamp = datetime.now().strftime("%y%m%d%H%M")
+        sender_id = self.data.get("sender_id", "SENDER")
+        receiver_id = self.data.get("receiver_id", "RECEIVER")
+        self.segments.append(
+            self._build_segment("UNB", ["UNOC", "3", sender_id, receiver_id, timestamp, self.message_ref])
+        )
+
+    def _add_unz_segment(self, segment_count: int) -> None:
+        self.segments.append(self._build_segment("UNZ", [segment_count, self.message_ref]))
+
+    def _add_header_segments(self) -> None:
+        self.segments.append(
+            self._build_segment("UNH", [self.message_ref, "INVOIC:D:96A:UN"])
+        )
+        self.segments.append(
+            self._build_segment("BGM", ["380", self.data["invoice_number"], "9"])
+        )
+        self.segments.append(
+            self._build_segment("DTM", ["137", self.data["invoice_date"], "102"])
+        )
+        
+        if self.data.get("due_date"):
+            self.segments.append(
+                self._build_segment("DTM", ["13", self.data["due_date"], "102"])
+            )
+
+    def _add_currency_segment(self) -> None:
+        self.segments.append(
+            self._build_segment("CUX", ["2", self.data["currency"], "9"])
+        )
+
+    def _add_party_segments(self) -> None:
+        for role, code in {"buyer": "BY", "seller": "SE"}.items():
+            party = self.data["parties"][role]
+            self.segments.append(
+                self._build_segment("NAD", [code, party["id"], "", "91", party.get("name", "")])
+            )
+            
+            if party.get("address"):
+                self.segments.append(
+                    self._build_segment("LOC", ["11", party["address"]])
+                )
+            
+            if party.get("contact"):
+                self.segments.append(
+                    self._build_segment("COM", [party["contact"], "TE"])
+                )
+
+    def _add_line_items(self) -> None:
+        for idx, item in enumerate(self.data["items"], start=1):
+            self.segments.append(
+                self._build_segment("LIN", [str(idx), "", item["id"], "EN"])
+            )
+            
+            if item.get("description"):
+                self.segments.append(
+                    self._build_segment("IMD", ["F", "", "", "", item["description"]])
+                )
+            
+            unit = item.get("unit", "PCE")
+            self.segments.append(
+                self._build_segment("QTY", ["47", self._format_decimal(item["quantity"]), unit])
+            )
+            
+            self.segments.append(
+                self._build_segment("PRI", ["AAA", self._format_decimal(item["price"]), unit])
+            )
+
+    def _add_summary_segments(self) -> None:
+        subtotal = sum(
+            Decimal(str(item["quantity"])) * Decimal(str(item["price"])) 
+            for item in self.data["items"]
+        )
+        
+        self.segments.append(
+            self._build_segment("MOA", ["79", self._format_decimal(subtotal)])
+        )
+        
+        if self.data.get("tax_rate"):
+            tax_rate = Decimal(str(self.data["tax_rate"]))
+            tax_amount = (subtotal * tax_rate / Decimal("100")).quantize(
+                Decimal(f"1.{'0'*self.precision}"), rounding=ROUND_HALF_UP
+            )
+            self.segments.append(
+                self._build_segment("TAX", ["7", "VAT", "", "", "", "", self._format_decimal(tax_rate)])
+            )
+            self.segments.append(
+                self._build_segment("MOA", ["124", self._format_decimal(tax_amount)])
+            )
+            subtotal += tax_amount
+        
+        if self.data.get("payment_terms"):
+            self.segments.append(
+                self._build_segment("PAI", [self.data["payment_terms"], "3"])
+            )
+
+    def _add_unt_segment(self) -> None:
+        unh_index = next(i for i, s in enumerate(self.segments) if s.startswith("UNH+"))
+        segment_count = len(self.segments) - unh_index
+        self.segments.append(
+            self._build_segment("UNT", [str(segment_count), self.message_ref])
+        )
 
     def generate(self) -> str:
         logger.info("Validating JSON input")
@@ -138,42 +280,21 @@ class EDIFACTGenerator:
         EDIFACTValidator.validate_fields(self.data)
 
         logger.info("Generating EDIFACT segments")
+        self.segments = []
 
-        # Mandatory headers
-        self.segments.append("UNH+{}+INVOIC:D:96A:UN'".format(self.message_ref))
-        self.segments.append(
-            self._build_segment("BGM", ["380", self.data["invoice_number"], "9"])
-        )
-        self.segments.append(
-            self._build_segment("DTM", ["137", self.data["invoice_date"], "102"])
-        )
-
-        # Parties
-        for role, code in {"buyer": "BY", "seller": "SU"}.items():
-            party = self.data["parties"][role]
-            self.segments.append(
-                self._build_segment("NAD", [code, party["id"], "", "", party.get("name", "")])
-            )
-
-        # Line items
-        for idx, item in enumerate(self.data["items"], start=1):
-            self.segments.append(self._build_segment("LIN", [idx, "", item["id"]]))
-            self.segments.append(
-                self._build_segment("QTY", ["47", self._format_decimal(item["quantity"])])
-            )
-            self.segments.append(
-                self._build_segment("PRI", ["AAA", self._format_decimal(item["price"])])
-            )
-
-        # Summary
-        total = sum(Decimal(str(it["quantity"])) * Decimal(str(it["price"])) for it in self.data["items"])
-        self.segments.append(self._build_segment("MOA", ["9", self._format_decimal(total)]))
-        self.segments.append("UNT+{}+{}'".format(len(self.segments) + 1, self.message_ref))
+        self._add_una_segment()
+        self._add_unb_segment()
+        self._add_header_segments()
+        self._add_currency_segment()
+        self._add_party_segments()
+        self._add_line_items()
+        self._add_summary_segments()
+        self._add_unt_segment()
+        self._add_unz_segment(len(self.segments))
 
         return self.line_ending.join(self.segments)
 
     def save_to_file(self, filename: Optional[str] = None) -> str:
-        """Save EDIFACT message to a .edi file and return path."""
         message = self.generate()
         if not filename:
             filename = f"invoice_{self.data['invoice_number']}.edi"
@@ -182,30 +303,56 @@ class EDIFACTGenerator:
         logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
         return filename
 
-
-# ----------------------------------------------------------------------------
-# Example usage
-# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     example_invoice = {
-        "charset": "UNOA",
-        "encoding": "UTF-8",
         "invoice_number": "INV12345",
-        "invoice_date": datetime.now().strftime("%Y%m%d"),
+        "invoice_date": "20250509",
+        "due_date": "20250609",
         "currency": "EUR",
+        "tax_rate": 21.0,
+        "payment_terms": "NET30",
+        "sender_id": "COMPANY_A",
+        "receiver_id": "COMPANY_B",
         "parties": {
-            "buyer": {"id": "BUYER123", "name": "Buyer Corp"},
-            "seller": {"id": "SELLER456", "name": "Seller Ltd"},
+            "buyer": {
+                "id": "BUYER123",
+                "name": "Buyer Corporation",
+                "address": "123 Main St",
+                "contact": "buyer@example.com"
+            },
+            "seller": {
+                "id": "SELLER456", 
+                "name": "Seller Ltd",
+                "address": "456 Oak Ave",
+                "contact": "sales@seller.com"
+            },
         },
         "items": [
-            {"id": "ITEM1", "quantity": "10", "price": "5.25"},
-            {"id": "ITEM2", "quantity": "3", "price": "12.40"},
+            {
+                "id": "ITEM001",
+                "description": "Premium Widget",
+                "quantity": 10,
+                "price": 25.50,
+                "unit": "PCE"
+            },
+            {
+                "id": "ITEM002",
+                "description": "Standard Widget",
+                "quantity": 5,
+                "price": 15.75,
+                "unit": "PCE"
+            },
         ],
     }
 
     try:
-        generator = EDIFACTGenerator(example_invoice, line_ending="\r\n")  # CRLF if required
+        generator = EDIFACTGenerator(example_invoice, line_ending="\r\n")
         filepath = generator.save_to_file()
         print(f"EDIFACT file generated: {filepath}")
+        
+        with open(filepath, 'r') as f:
+            print("\nGenerated EDIFACT content:")
+            print(f.read())
+            
     except EDIFACTBaseError as e:
         logger.error(f"EDIFACT generation failed: {e}")
