@@ -1,12 +1,12 @@
 import json
 import logging
 import re
-from decimal import Decimal, ROUND_HALF_UP
+import os
+import uuid
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-import uuid
 from jsonschema import validate, ValidationError
-import os
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,6 +28,16 @@ class EDIFACTConfig:
     MAX_NAME_LENGTH = 70
     MAX_ITEM_ID_LENGTH = 35
     MAX_TEXT_LENGTH = 350
+    SEGMENT_TERMINATOR = "'"
+    DATA_ELEMENT_SEPARATOR = "+"
+    COMPONENT_SEPARATOR = ":"
+    MAX_SEGMENT_LENGTH = 2000
+    
+    @classmethod
+    def configure(cls, **kwargs):
+        for key, value in kwargs.items():
+            if hasattr(cls, key):
+                setattr(cls, key, value)
 
 class EDIFACTValidator:
     JSON_SCHEMA = {
@@ -79,7 +89,18 @@ class EDIFACTValidator:
                     "required": ["id", "quantity", "price"]
                 }
             },
-            "payment_terms": {"type": "string"}
+            "payment_terms": {"type": "string"},
+            "notes": {"type": "string"},
+            "bank_account": {
+                "type": "object",
+                "properties": {
+                    "account": {"type": "string"},
+                    "bank_code": {"type": "string"}
+                }
+            },
+            "sender_id": {"type": "string"},
+            "receiver_id": {"type": "string"},
+            "message_ref": {"type": "string"}
         },
         "required": ["invoice_number", "invoice_date", "currency", "parties", "items"]
     }
@@ -108,6 +129,8 @@ class EDIFACTValidator:
         
         for idx, item in enumerate(data["items"]):
             cls._validate_item(item, idx)
+        
+        cls._validate_interdependencies(data)
 
     @classmethod
     def _validate_date(cls, date_str: str, field_name: str) -> None:
@@ -140,19 +163,52 @@ class EDIFACTValidator:
         if item["price"] <= 0:
             raise EDIFACTValidationError(f"Item {index} price must be positive")
 
+    @classmethod
+    def _validate_interdependencies(cls, data: Dict[str, Any]) -> None:
+        if data.get("due_date"):
+            invoice_date = datetime.strptime(data["invoice_date"], "%Y%m%d")
+            due_date = datetime.strptime(data["due_date"], "%Y%m%d")
+            if due_date <= invoice_date:
+                raise EDIFACTValidationError("Due date must be after invoice date")
+        
+        item_ids = [item["id"] for item in data["items"]]
+        if len(item_ids) != len(set(item_ids)):
+            raise EDIFACTValidationError("Item IDs must be unique")
+
 class EDIFACTGenerator:
     def __init__(self, data: Dict[str, Any], precision: int = 2, line_ending: str = "\n"):
-        self.data = data
+        self.data = self._sanitize_input(data)
         self.precision = precision
         self.line_ending = line_ending
         self.message_ref = data.get("message_ref") or str(uuid.uuid4().int)[:14]
         self.segments: List[str] = []
 
+    def _sanitize_input(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                sanitized[key] = re.sub(r'[\x00-\x1F\x7F]', '', value)
+            elif isinstance(value, dict):
+                sanitized[key] = self._sanitize_input(value)
+            elif isinstance(value, list):
+                sanitized[key] = [self._sanitize_input(item) if isinstance(item, dict) else item for item in value]
+            else:
+                sanitized[key] = value
+        return sanitized
+
     def _format_decimal(self, value: Any) -> str:
-        d = Decimal(str(value)).quantize(
-            Decimal(f"1.{'0'*self.precision}"), rounding=ROUND_HALF_UP
-        )
-        return f"{d:.{self.precision}f}"
+        try:
+            if isinstance(value, float) and (abs(value) > 1e15 or abs(value) < 1e-15):
+                d = Decimal(str(value))
+            else:
+                d = Decimal(value)
+            
+            formatted = f"{d:.{self.precision}f}"
+            if '.' in formatted:
+                formatted = formatted.rstrip('0').rstrip('.')
+            return formatted
+        except (ValueError, TypeError, InvalidOperation) as e:
+            raise EDIFACTGenerationError(f"Invalid numeric value: {value} - {e}")
 
     def _escape_segment_value(self, value: Any) -> str:
         if value is None:
@@ -163,9 +219,25 @@ class EDIFACTGenerator:
             s = s.replace(char, f"?{char}")
         return s
 
+    def _validate_segment(self, tag: str, elements: List[Any]) -> None:
+        if tag == "LIN" and len(elements) < 3:
+            raise EDIFACTGenerationError(f"LIN segment requires at least 3 elements")
+        if tag == "UNH" and len(elements) < 2:
+            raise EDIFACTGenerationError(f"UNH segment requires at least 2 elements")
+
     def _build_segment(self, tag: str, elements: List[Any]) -> str:
+        if not elements:
+            elements = []
+        
+        self._validate_segment(tag, elements)
+        
         escaped_elements = [self._escape_segment_value(e) for e in elements]
-        return "+".join([tag] + escaped_elements) + "'"
+        segment = "+".join([tag] + escaped_elements) + "'"
+        
+        if len(segment) > EDIFACTConfig.MAX_SEGMENT_LENGTH:
+            logger.warning(f"Segment {tag} exceeds recommended length: {len(segment)}")
+        
+        return segment
 
     def _add_una_segment(self) -> None:
         self.segments.append("UNA:+.? '")
@@ -239,6 +311,22 @@ class EDIFACTGenerator:
                 self._build_segment("PRI", ["AAA", self._format_decimal(item["price"]), unit])
             )
 
+    def _add_ftx_segments(self) -> None:
+        if self.data.get("notes"):
+            notes = self.data["notes"]
+            chunks = [notes[i:i+70] for i in range(0, len(notes), 70)]
+            for i, chunk in enumerate(chunks, 1):
+                self.segments.append(
+                    self._build_segment("FTX", ["AAI", str(i), "", "", chunk])
+                )
+
+    def _add_payment_instructions(self) -> None:
+        if self.data.get("bank_account"):
+            bank_data = self.data["bank_account"]
+            self.segments.append(
+                self._build_segment("FII", ["BE", "", bank_data.get("account"), "", bank_data.get("bank_code")])
+            )
+
     def _add_summary_segments(self) -> None:
         subtotal = sum(
             Decimal(str(item["quantity"])) * Decimal(str(item["price"])) 
@@ -288,20 +376,63 @@ class EDIFACTGenerator:
         self._add_currency_segment()
         self._add_party_segments()
         self._add_line_items()
+        self._add_ftx_segments()
+        self._add_payment_instructions()
         self._add_summary_segments()
         self._add_unt_segment()
         self._add_unz_segment(len(self.segments))
 
-        return self.line_ending.join(self.segments)
+        edifact_content = self.line_ending.join(self.segments)
+        
+        if not self.validate_edifact_syntax(edifact_content):
+            raise EDIFACTGenerationError("Generated EDIFACT content failed syntax validation")
+            
+        return edifact_content
+
+    def validate_edifact_syntax(self, content: str) -> bool:
+        lines = content.split(self.line_ending)
+        if not lines[0].startswith("UNA"):
+            return False
+        
+        for line in lines[1:]:
+            if not line.endswith("'"):
+                return False
+            if "??" in line and "?" in line.replace("??", ""):
+                return False
+        
+        return True
+
+    def _validate_file_path(self, filename: str) -> None:
+        if not filename:
+            return
+        
+        safe_filename = os.path.basename(filename)
+        if safe_filename != filename:
+            raise EDIFACTGenerationError("Invalid filename provided")
+        
+        if not filename.lower().endswith(('.edi', '.edifact')):
+            logger.warning("Recommended file extension is .edi or .edifact")
 
     def save_to_file(self, filename: Optional[str] = None) -> str:
         message = self.generate()
         if not filename:
             filename = f"invoice_{self.data['invoice_number']}.edi"
+        
+        self._validate_file_path(filename)
+        
         with open(filename, "w", encoding="utf-8", newline="") as f:
             f.write(message)
         logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
         return filename
+
+    @classmethod
+    def from_json_file(cls, filepath: str, **kwargs) -> 'EDIFACTGenerator':
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return cls(data, **kwargs)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.data.copy()
 
 if __name__ == "__main__":
     example_invoice = {
@@ -313,6 +444,11 @@ if __name__ == "__main__":
         "payment_terms": "NET30",
         "sender_id": "COMPANY_A",
         "receiver_id": "COMPANY_B",
+        "notes": "Thank you for your business. Please note that payments should be made within 30 days.",
+        "bank_account": {
+            "account": "NL91ABNA0417164300",
+            "bank_code": "ABNANL2A"
+        },
         "parties": {
             "buyer": {
                 "id": "BUYER123",
