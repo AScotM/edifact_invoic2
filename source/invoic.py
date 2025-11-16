@@ -11,6 +11,9 @@ from jsonschema import validate, ValidationError
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x1F\x7F]')
+ESCAPE_CHARS = ["'", "+", ":", "*"]
+
 class EDIFACTBaseError(Exception):
     pass
 
@@ -32,6 +35,7 @@ class EDIFACTConfig:
     DATA_ELEMENT_SEPARATOR = "+"
     COMPONENT_SEPARATOR = ":"
     MAX_SEGMENT_LENGTH = 2000
+    DEFAULT_PRECISION = 2
     
     @classmethod
     def configure(cls, **kwargs):
@@ -44,19 +48,19 @@ class EDIFACTValidator:
         "type": "object",
         "properties": {
             "charset": {"type": "string"},
-            "invoice_number": {"type": "string"},
+            "invoice_number": {"type": "string", "maxLength": 35},
             "invoice_date": {"type": "string"},
             "currency": {"type": "string"},
             "due_date": {"type": "string"},
-            "tax_rate": {"type": "number"},
+            "tax_rate": {"type": "number", "minimum": 0, "maximum": 100},
             "parties": {
                 "type": "object",
                 "properties": {
                     "buyer": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "name": {"type": "string"},
+                            "id": {"type": "string", "maxLength": EDIFACTConfig.MAX_PARTY_ID_LENGTH},
+                            "name": {"type": "string", "maxLength": EDIFACTConfig.MAX_NAME_LENGTH},
                             "address": {"type": "string"},
                             "contact": {"type": "string"}
                         },
@@ -65,8 +69,8 @@ class EDIFACTValidator:
                     "seller": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string"},
-                            "name": {"type": "string"},
+                            "id": {"type": "string", "maxLength": EDIFACTConfig.MAX_PARTY_ID_LENGTH},
+                            "name": {"type": "string", "maxLength": EDIFACTConfig.MAX_NAME_LENGTH},
                             "address": {"type": "string"},
                             "contact": {"type": "string"}
                         },
@@ -77,20 +81,21 @@ class EDIFACTValidator:
             },
             "items": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        "id": {"type": "string", "maxLength": EDIFACTConfig.MAX_ITEM_ID_LENGTH},
                         "description": {"type": "string"},
-                        "quantity": {"type": "number"},
-                        "price": {"type": "number"},
+                        "quantity": {"type": "number", "minimum": 0.001},
+                        "price": {"type": "number", "minimum": 0},
                         "unit": {"type": "string"}
                     },
                     "required": ["id", "quantity", "price"]
                 }
             },
             "payment_terms": {"type": "string"},
-            "notes": {"type": "string"},
+            "notes": {"type": "string", "maxLength": EDIFACTConfig.MAX_TEXT_LENGTH},
             "bank_account": {
                 "type": "object",
                 "properties": {
@@ -150,18 +155,18 @@ class EDIFACTValidator:
             raise EDIFACTValidationError(f"{role} ID too long: {len(party['id'])} > {EDIFACTConfig.MAX_PARTY_ID_LENGTH}")
         
         if party.get("name") and len(party["name"]) > EDIFACTConfig.MAX_NAME_LENGTH:
-            raise EDIFACTValidationError(f"{role} name too long")
+            raise EDIFACTValidationError(f"{role} name too long: {len(party['name'])} > {EDIFACTConfig.MAX_NAME_LENGTH}")
 
     @classmethod
     def _validate_item(cls, item: Dict[str, Any], index: int) -> None:
         if len(item["id"]) > EDIFACTConfig.MAX_ITEM_ID_LENGTH:
-            raise EDIFACTValidationError(f"Item {index} ID too long")
+            raise EDIFACTValidationError(f"Item {index} ID too long: {len(item['id'])} > {EDIFACTConfig.MAX_ITEM_ID_LENGTH}")
         
         if item["quantity"] <= 0:
             raise EDIFACTValidationError(f"Item {index} quantity must be positive")
         
-        if item["price"] <= 0:
-            raise EDIFACTValidationError(f"Item {index} price must be positive")
+        if item["price"] < 0:
+            raise EDIFACTValidationError(f"Item {index} price must be non-negative")
 
     @classmethod
     def _validate_interdependencies(cls, data: Dict[str, Any]) -> None:
@@ -176,9 +181,9 @@ class EDIFACTValidator:
             raise EDIFACTValidationError("Item IDs must be unique")
 
 class EDIFACTGenerator:
-    def __init__(self, data: Dict[str, Any], precision: int = 2, line_ending: str = "\n"):
+    def __init__(self, data: Dict[str, Any], precision: int = None, line_ending: str = "\n"):
         self.data = self._sanitize_input(data)
-        self.precision = precision
+        self.precision = precision if precision is not None else EDIFACTConfig.DEFAULT_PRECISION
         self.line_ending = line_ending
         self.message_ref = data.get("message_ref") or str(uuid.uuid4().int)[:14]
         self.segments: List[str] = []
@@ -187,7 +192,7 @@ class EDIFACTGenerator:
         sanitized = {}
         for key, value in data.items():
             if isinstance(value, str):
-                sanitized[key] = re.sub(r'[\x00-\x1F\x7F]', '', value)
+                sanitized[key] = CONTROL_CHAR_REGEX.sub('', value)
             elif isinstance(value, dict):
                 sanitized[key] = self._sanitize_input(value)
             elif isinstance(value, list):
@@ -198,12 +203,13 @@ class EDIFACTGenerator:
 
     def _format_decimal(self, value: Any) -> str:
         try:
-            if isinstance(value, float) and (abs(value) > 1e15 or abs(value) < 1e-15):
+            if isinstance(value, (int, float)):
                 d = Decimal(str(value))
             else:
                 d = Decimal(value)
             
-            formatted = f"{d:.{self.precision}f}"
+            quantized = d.quantize(Decimal(f"1.{'0'*self.precision}"), rounding=ROUND_HALF_UP)
+            formatted = f"{quantized:.{self.precision}f}"
             if '.' in formatted:
                 formatted = formatted.rstrip('0').rstrip('.')
             return formatted
@@ -215,28 +221,24 @@ class EDIFACTGenerator:
             return ""
         s = str(value)
         s = s.replace("?", "??")
-        for char in ["'", "+", ":", "*"]:
+        for char in ESCAPE_CHARS:
             s = s.replace(char, f"?{char}")
         return s
 
-    def _validate_segment(self, tag: str, elements: List[Any]) -> None:
-        if tag == "LIN" and len(elements) < 3:
-            raise EDIFACTGenerationError(f"LIN segment requires at least 3 elements")
-        if tag == "UNH" and len(elements) < 2:
-            raise EDIFACTGenerationError(f"UNH segment requires at least 2 elements")
+    def _validate_segment_length(self, segment: str) -> None:
+        if len(segment) > EDIFACTConfig.MAX_SEGMENT_LENGTH:
+            raise EDIFACTGenerationError(
+                f"Segment too long: {len(segment)} > {EDIFACTConfig.MAX_SEGMENT_LENGTH}",
+            )
 
     def _build_segment(self, tag: str, elements: List[Any]) -> str:
         if not elements:
             elements = []
         
-        self._validate_segment(tag, elements)
-        
         escaped_elements = [self._escape_segment_value(e) for e in elements]
         segment = "+".join([tag] + escaped_elements) + "'"
         
-        if len(segment) > EDIFACTConfig.MAX_SEGMENT_LENGTH:
-            logger.warning(f"Segment {tag} exceeds recommended length: {len(segment)}")
-        
+        self._validate_segment_length(segment)
         return segment
 
     def _add_una_segment(self) -> None:
@@ -246,8 +248,9 @@ class EDIFACTGenerator:
         timestamp = datetime.now().strftime("%y%m%d%H%M")
         sender_id = self.data.get("sender_id", "SENDER")
         receiver_id = self.data.get("receiver_id", "RECEIVER")
+        charset = self.data.get("charset", "UNOC")
         self.segments.append(
-            self._build_segment("UNB", ["UNOC", "3", sender_id, receiver_id, timestamp, self.message_ref])
+            self._build_segment("UNB", [charset, "3", sender_id, receiver_id, timestamp, self.message_ref])
         )
 
     def _add_unz_segment(self, segment_count: int) -> None:
@@ -314,7 +317,8 @@ class EDIFACTGenerator:
     def _add_ftx_segments(self) -> None:
         if self.data.get("notes"):
             notes = self.data["notes"]
-            chunks = [notes[i:i+70] for i in range(0, len(notes), 70)]
+            max_length = 70
+            chunks = [notes[i:i+max_length] for i in range(0, len(notes), max_length)]
             for i, chunk in enumerate(chunks, 1):
                 self.segments.append(
                     self._build_segment("FTX", ["AAI", str(i), "", "", chunk])
@@ -328,13 +332,16 @@ class EDIFACTGenerator:
             )
 
     def _add_summary_segments(self) -> None:
-        subtotal = sum(
-            Decimal(str(item["quantity"])) * Decimal(str(item["price"])) 
-            for item in self.data["items"]
-        )
+        subtotal = Decimal("0.00")
+        for item in self.data["items"]:
+            quantity = Decimal(str(item["quantity"]))
+            price = Decimal(str(item["price"]))
+            subtotal += quantity * price
+
+        subtotal_quantized = subtotal.quantize(Decimal(f"1.{'0'*self.precision}"), rounding=ROUND_HALF_UP)
         
         self.segments.append(
-            self._build_segment("MOA", ["79", self._format_decimal(subtotal)])
+            self._build_segment("MOA", ["79", self._format_decimal(subtotal_quantized)])
         )
         
         if self.data.get("tax_rate"):
@@ -348,7 +355,10 @@ class EDIFACTGenerator:
             self.segments.append(
                 self._build_segment("MOA", ["124", self._format_decimal(tax_amount)])
             )
-            subtotal += tax_amount
+            total_amount = subtotal_quantized + tax_amount
+            self.segments.append(
+                self._build_segment("MOA", ["86", self._format_decimal(total_amount)])
+            )
         
         if self.data.get("payment_terms"):
             self.segments.append(
@@ -356,14 +366,18 @@ class EDIFACTGenerator:
             )
 
     def _add_unt_segment(self) -> None:
-        unh_index = next(i for i, s in enumerate(self.segments) if s.startswith("UNH+"))
-        segment_count = len(self.segments) - unh_index
+        unh_indices = [i for i, s in enumerate(self.segments) if s.startswith("UNH+")]
+        if not unh_indices:
+            raise EDIFACTGenerationError("UNH segment not found")
+        
+        unh_index = unh_indices[0]
+        segment_count = len(self.segments) - unh_index + 1
         self.segments.append(
             self._build_segment("UNT", [str(segment_count), self.message_ref])
         )
 
     def generate(self) -> str:
-        logger.info("Validating JSON input")
+        logger.info(f"Starting EDIFACT generation for invoice {self.data.get('invoice_number', 'Unknown')}")
         EDIFACTValidator.validate_schema(self.data)
         EDIFACTValidator.validate_fields(self.data)
 
@@ -383,6 +397,8 @@ class EDIFACTGenerator:
         self._add_unz_segment(len(self.segments))
 
         edifact_content = self.line_ending.join(self.segments)
+        
+        logger.debug(f"Generated {len(self.segments)} segments")
         
         if not self.validate_edifact_syntax(edifact_content):
             raise EDIFACTGenerationError("Generated EDIFACT content failed syntax validation")
@@ -420,16 +436,22 @@ class EDIFACTGenerator:
         
         self._validate_file_path(filename)
         
-        with open(filename, "w", encoding="utf-8", newline="") as f:
-            f.write(message)
-        logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
-        return filename
+        try:
+            with open(filename, "w", encoding="utf-8", newline="") as f:
+                f.write(message)
+            logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
+            return filename
+        except IOError as e:
+            raise EDIFACTGenerationError(f"Failed to write file: {e}")
 
     @classmethod
     def from_json_file(cls, filepath: str, **kwargs) -> 'EDIFACTGenerator':
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return cls(data, **kwargs)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return cls(data, **kwargs)
+        except (IOError, json.JSONDecodeError) as e:
+            raise EDIFACTGenerationError(f"Failed to load JSON file: {e}")
 
     def to_dict(self) -> Dict[str, Any]:
         return self.data.copy()
