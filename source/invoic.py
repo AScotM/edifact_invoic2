@@ -242,15 +242,17 @@ class EDIFACTGenerator:
         return segment
 
     def _add_una_segment(self) -> None:
-        self.segments.append("UNA:+.? '")
+        una_segment = f"UNA{EDIFACTConfig.DATA_ELEMENT_SEPARATOR}{EDIFACTConfig.COMPONENT_SEPARATOR}.? '"
+        self.segments.append(una_segment)
 
     def _add_unb_segment(self) -> None:
         timestamp = datetime.now().strftime("%y%m%d%H%M")
         sender_id = self.data.get("sender_id", "SENDER")
         receiver_id = self.data.get("receiver_id", "RECEIVER")
         charset = self.data.get("charset", "UNOC")
+        version = "3"
         self.segments.append(
-            self._build_segment("UNB", [charset, "3", sender_id, receiver_id, timestamp, self.message_ref])
+            self._build_segment("UNB", [charset, version, sender_id, receiver_id, timestamp, self.message_ref])
         )
 
     def _add_unz_segment(self, segment_count: int) -> None:
@@ -327,9 +329,10 @@ class EDIFACTGenerator:
     def _add_payment_instructions(self) -> None:
         if self.data.get("bank_account"):
             bank_data = self.data["bank_account"]
-            self.segments.append(
-                self._build_segment("FII", ["BE", "", bank_data.get("account"), "", bank_data.get("bank_code")])
-            )
+            if bank_data.get("account") and bank_data.get("bank_code"):
+                self.segments.append(
+                    self._build_segment("FII", ["BE", "", bank_data.get("account"), "", bank_data.get("bank_code")])
+                )
 
     def _add_summary_segments(self) -> None:
         subtotal = Decimal("0.00")
@@ -359,7 +362,11 @@ class EDIFACTGenerator:
             self.segments.append(
                 self._build_segment("MOA", ["86", self._format_decimal(total_amount)])
             )
-        
+        else:
+            self.segments.append(
+                self._build_segment("MOA", ["86", self._format_decimal(subtotal_quantized)])
+            )
+
         if self.data.get("payment_terms"):
             self.segments.append(
                 self._build_segment("PAI", [self.data["payment_terms"], "3"])
@@ -371,7 +378,7 @@ class EDIFACTGenerator:
             raise EDIFACTGenerationError("UNH segment not found")
         
         unh_index = unh_indices[0]
-        segment_count = len(self.segments) - unh_index + 1
+        segment_count = len(self.segments) - unh_index
         self.segments.append(
             self._build_segment("UNT", [str(segment_count), self.message_ref])
         )
