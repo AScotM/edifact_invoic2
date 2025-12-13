@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x1F\x7F]')
-ESCAPE_CHARS = ["'", "+", ":", "*"]
+ESCAPE_CHARS = ["'", "+", ":", "*", "?"]
 
 DATE_FORMATS = {
     "102": "%Y%m%d",
@@ -45,8 +45,13 @@ class EDIFACTConfig:
     SEGMENT_TERMINATOR = "'"
     DATA_ELEMENT_SEPARATOR = "+"
     COMPONENT_SEPARATOR = ":"
+    REPETITION_SEPARATOR = "*"
+    DECIMAL_NOTATION = "."
+    RELEASE_CHARACTER = "?"
     MAX_SEGMENT_LENGTH = 2000
     DEFAULT_PRECISION = 2
+    DEFAULT_VERSION = "D"
+    DEFAULT_RELEASE = "96A"
     
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -231,7 +236,9 @@ class EDIFACTGenerator:
         self.config = config or EDIFACTConfig()
         self.line_ending = line_ending
         self.message_ref = data.get("message_ref") or str(uuid.uuid4().int)[:14]
+        self.interchange_ref = data.get("interchange_ref") or str(uuid.uuid4().int)[:14]
         self.segments: List[str] = []
+        self._generated = False
 
     def _sanitize_input(self, data: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = {}
@@ -255,16 +262,11 @@ class EDIFACTGenerator:
             
             quantized = d.quantize(Decimal(f"1.{'0'*self.config.DEFAULT_PRECISION}"), rounding=ROUND_HALF_UP)
             
-            if d != quantized:
-                raise EDIFACTGenerationError(
-                    f"Decimal value {value} exceeds configured precision",
-                    "GEN_002",
-                    {"value": str(value), "precision": self.config.DEFAULT_PRECISION}
-                )
-            
             formatted = f"{quantized:.{self.config.DEFAULT_PRECISION}f}"
-            if '.' in formatted:
-                formatted = formatted.rstrip('0').rstrip('.')
+            
+            if self.data.get("charset") in ["UNOA", "UNOB"]:
+                formatted = formatted.replace('.', ',')
+            
             return formatted
         except (ValueError, TypeError, InvalidOperation) as e:
             raise EDIFACTGenerationError(f"Invalid numeric value: {value}", "GEN_003", {"error": str(e)})
@@ -277,10 +279,14 @@ class EDIFACTGenerator:
         for char in str(value):
             if CONTROL_CHAR_REGEX.match(char):
                 continue
-            elif char == '?':
-                result.extend(['?', '?'])
-            elif char in ESCAPE_CHARS:
-                result.extend(['?', char])
+            elif char == self.config.RELEASE_CHARACTER:
+                result.extend([self.config.RELEASE_CHARACTER, self.config.RELEASE_CHARACTER])
+            elif char in [self.config.SEGMENT_TERMINATOR, 
+                         self.config.DATA_ELEMENT_SEPARATOR,
+                         self.config.COMPONENT_SEPARATOR,
+                         self.config.REPETITION_SEPARATOR,
+                         self.config.RELEASE_CHARACTER]:
+                result.extend([self.config.RELEASE_CHARACTER, char])
             else:
                 result.append(char)
         return ''.join(result)
@@ -298,19 +304,20 @@ class EDIFACTGenerator:
             elements = []
         
         escaped_elements = [self._escape_segment_value(e) for e in elements]
-        segment = "+".join([tag] + escaped_elements) + "'"
+        segment = self.config.DATA_ELEMENT_SEPARATOR.join([tag] + escaped_elements) + self.config.SEGMENT_TERMINATOR
         
         self._validate_segment_length(segment)
         return segment
 
     def _add_una_segment(self) -> None:
-        charset = self.data.get("charset", "UNOC")
-        if charset == "UNOA":
-            una_segment = f"UNA:+.? '"
-        elif charset == "UNOB":
-            una_segment = f"UNA:+.? '"
-        else:
-            una_segment = f"UNA:+.? '"
+        component_sep = self.config.COMPONENT_SEPARATOR
+        data_sep = self.config.DATA_ELEMENT_SEPARATOR
+        decimal_char = self.config.DECIMAL_NOTATION
+        release_char = self.config.RELEASE_CHARACTER
+        reserved_char = " "
+        segment_term = self.config.SEGMENT_TERMINATOR
+        
+        una_segment = f"UNA{component_sep}{data_sep}{decimal_char}{release_char}{reserved_char}{segment_term}"
         self.segments.append(una_segment)
 
     def _add_unb_segment(self) -> None:
@@ -318,17 +325,38 @@ class EDIFACTGenerator:
         sender_id = self.data.get("sender_id", "SENDER")
         receiver_id = self.data.get("receiver_id", "RECEIVER")
         charset = self.data.get("charset", "UNOC")
-        version = "3"
+        version = self.data.get("version", self.config.DEFAULT_VERSION)
+        application_ref = self.data.get("application_ref", "")
+        priority = self.data.get("priority", "")
+        ack_request = self.data.get("ack_request", "0")
+        agreement_id = self.data.get("agreement_id", "")
+        test_indicator = self.data.get("test_indicator", "1")
+        
         self.segments.append(
-            self._build_segment("UNB", [f"{charset}:{version}", sender_id, receiver_id, timestamp, self.message_ref])
+            self._build_segment("UNB", [
+                f"{charset}:{version}",
+                sender_id,
+                receiver_id,
+                timestamp,
+                self.interchange_ref,
+                application_ref,
+                priority,
+                ack_request,
+                agreement_id,
+                test_indicator
+            ])
         )
 
     def _add_unz_segment(self) -> None:
-        self.segments.append(self._build_segment("UNZ", ["1", self.message_ref]))
+        group_count = "1"
+        self.segments.append(self._build_segment("UNZ", [group_count, self.interchange_ref]))
 
     def _add_header_segments(self) -> None:
         self.segments.append(
-            self._build_segment("UNH", [self.message_ref, "INVOIC:D:96A:UN"])
+            self._build_segment("UNH", [
+                self.message_ref, 
+                f"INVOIC:{self.config.DEFAULT_VERSION}:{self.config.DEFAULT_RELEASE}:UN"
+            ])
         )
         self.segments.append(
             self._build_segment("BGM", ["380", self.data["invoice_number"], "9"])
@@ -341,6 +369,16 @@ class EDIFACTGenerator:
             self.segments.append(
                 self._build_segment("DTM", ["13", self.data["due_date"], "102"])
             )
+        
+        if self.data.get("payment_terms"):
+            self.segments.append(
+                self._build_segment("PAI", [self.data["payment_terms"], "3"])
+            )
+            
+            if self.data.get("payment_due_date"):
+                self.segments.append(
+                    self._build_segment("DTM", ["12", self.data["payment_due_date"], "102"])
+                )
 
     def _add_currency_segment(self) -> None:
         self.segments.append(
@@ -383,6 +421,11 @@ class EDIFACTGenerator:
             self.segments.append(
                 self._build_segment("PRI", ["AAA", self._format_decimal(item["price"]), unit])
             )
+            
+            if item.get("tax_category"):
+                self.segments.append(
+                    self._build_segment("TAX", ["7", item["tax_category"], "", "", "", "", ""])
+                )
 
     def _add_ftx_segments(self) -> None:
         if self.data.get("notes"):
@@ -435,23 +478,21 @@ class EDIFACTGenerator:
                 self._build_segment("MOA", ["86", self._format_decimal(subtotal_quantized)])
             )
 
-        if self.data.get("payment_terms"):
-            self.segments.append(
-                self._build_segment("PAI", [self.data["payment_terms"], "3"])
-            )
-
     def _add_unt_segment(self) -> None:
         unh_indices = [i for i, s in enumerate(self.segments) if s.startswith("UNH+")]
         if not unh_indices:
             raise EDIFACTGenerationError("UNH segment not found", "GEN_005")
         
         unh_index = unh_indices[0]
-        segment_count = len(self.segments) - unh_index
+        segment_count = len(self.segments) - unh_index + 1
         self.segments.append(
             self._build_segment("UNT", [str(segment_count), self.message_ref])
         )
 
     def generate(self) -> str:
+        if self._generated:
+            return self.line_ending.join(self.segments)
+            
         logger.info(f"Starting EDIFACT generation for invoice {self.data.get('invoice_number', 'Unknown')}")
         EDIFACTValidator.validate_schema(self.data)
         EDIFACTValidator.validate_fields(self.data, self.config)
@@ -477,17 +518,33 @@ class EDIFACTGenerator:
         
         if not self.validate_edifact_syntax(edifact_content):
             raise EDIFACTGenerationError("Generated EDIFACT content failed syntax validation", "GEN_006")
-            
+        
+        self._generated = True
         return edifact_content
 
     def validate_edifact_syntax(self, content: str) -> bool:
         lines = content.split(self.line_ending)
         if not lines[0].startswith("UNA"):
+            logger.error("Missing UNA segment")
             return False
         
-        for line in lines[1:]:
-            if not line.endswith("'"):
+        for i, line in enumerate(lines[1:], 1):
+            if not line.endswith(self.config.SEGMENT_TERMINATOR):
+                logger.error(f"Line {i} missing segment terminator: {line[:50]}")
                 return False
+            
+            if len(line) > self.config.MAX_SEGMENT_LENGTH:
+                logger.error(f"Line {i} exceeds max length: {len(line)} > {self.config.MAX_SEGMENT_LENGTH}")
+                return False
+        
+        unh_count = sum(1 for line in lines if line.startswith("UNH+"))
+        unt_count = sum(1 for line in lines if line.startswith("UNT+"))
+        unb_count = sum(1 for line in lines if line.startswith("UNB+"))
+        unz_count = sum(1 for line in lines if line.startswith("UNZ+"))
+        
+        if unh_count != 1 or unt_count != 1 or unb_count != 1 or unz_count != 1:
+            logger.error(f"Segment count mismatch: UNH={unh_count}, UNT={unt_count}, UNB={unb_count}, UNZ={unz_count}")
+            return False
         
         return True
 
@@ -495,9 +552,10 @@ class EDIFACTGenerator:
         if not filename:
             return
         
-        safe_filename = os.path.basename(filename)
-        if safe_filename != filename:
-            raise EDIFACTGenerationError("Invalid filename provided", "IO_001")
+        if '/' in filename or '\\' in filename:
+            directory = os.path.dirname(filename)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
         
         if not filename.lower().endswith(('.edi', '.edifact')):
             logger.warning("Recommended file extension is .edi or .edifact")
@@ -534,11 +592,17 @@ if __name__ == "__main__":
         "invoice_number": "INV12345",
         "invoice_date": "20250509",
         "due_date": "20250609",
+        "payment_due_date": "20250609",
         "currency": "EUR",
         "tax_rate": 21.0,
         "payment_terms": "NET30",
         "sender_id": "COMPANY_A",
         "receiver_id": "COMPANY_B",
+        "charset": "UNOC",
+        "version": "D",
+        "application_ref": "INVOICE_APP",
+        "ack_request": "1",
+        "test_indicator": "0",
         "notes": "Thank you for your business. Please note that payments should be made within 30 days.",
         "bank_account": {
             "account": "NL91ABNA0417164300",
