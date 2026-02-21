@@ -3,8 +3,9 @@ import logging
 import re
 import os
 import uuid
+import time
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict, NotRequired
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -18,6 +19,73 @@ DATE_FORMATS = {
     "203": "%Y%m%d%H%M",
     "101": "%y%m%d"
 }
+
+SEGMENT_CODES = {
+    "INVOICE_TYPE": "380",
+    "CREDIT_NOTE_TYPE": "381",
+    "DEBIT_NOTE_TYPE": "383",
+    "DATE_ISSUED": "137",
+    "DATE_DUE": "13",
+    "DATE_PAYMENT_DUE": "12",
+    "CURRENCY_INVOICE": "2",
+    "PARTY_BUYER": "BY",
+    "PARTY_SELLER": "SE",
+    "LOCATION_PLACE": "11",
+    "COMMUNICATION_TELEPHONE": "TE",
+    "COMMUNICATION_EMAIL": "EM",
+    "ITEM_IDENTIFICATION": "EN",
+    "QUALIFIER_ORDERED": "47",
+    "PRICE_NET": "AAA",
+    "TAX_SERVICE": "7",
+    "TAX_VAT": "VAT",
+    "MOA_LINE_TOTAL": "79",
+    "MOA_TAX_TOTAL": "124",
+    "MOA_INVOICE_TOTAL": "86",
+    "FTX_TEXT": "AAI",
+    "FII_ACCOUNT": "BE"
+}
+
+class PartyDict(TypedDict):
+    id: str
+    name: NotRequired[str]
+    address: NotRequired[str]
+    contact: NotRequired[str]
+
+class BankAccountDict(TypedDict):
+    account: str
+    bank_code: NotRequired[str]
+
+class ItemDict(TypedDict):
+    id: str
+    quantity: Decimal
+    price: Decimal
+    description: NotRequired[str]
+    unit: NotRequired[str]
+    tax_category: NotRequired[str]
+
+class InvoiceDict(TypedDict):
+    invoice_number: str
+    invoice_date: str
+    currency: str
+    parties: Dict[str, PartyDict]
+    items: List[ItemDict]
+    due_date: NotRequired[str]
+    payment_due_date: NotRequired[str]
+    tax_rate: NotRequired[float]
+    payment_terms: NotRequired[str]
+    sender_id: NotRequired[str]
+    receiver_id: NotRequired[str]
+    charset: NotRequired[str]
+    version: NotRequired[str]
+    application_ref: NotRequired[str]
+    ack_request: NotRequired[str]
+    test_indicator: NotRequired[str]
+    notes: NotRequired[str]
+    bank_account: NotRequired[BankAccountDict]
+    message_ref: NotRequired[str]
+    interchange_ref: NotRequired[str]
+    agreement_id: NotRequired[str]
+    priority: NotRequired[str]
 
 class EDIFACTBaseError(Exception):
     pass
@@ -38,10 +106,12 @@ class EDIFACTConfig:
     SUPPORTED_CHARSETS = {"UNOA", "UNOB", "UNOC"}
     SUPPORTED_CURRENCIES = {"EUR", "USD", "GBP", "JPY", "CAD"}
     SUPPORTED_DATE_FORMATS = {"102", "203", "101"}
+    SUPPORTED_PAYMENT_TERMS = {"NET30", "NET60", "CASH", "NET15", "NET45"}
     MAX_PARTY_ID_LENGTH = 35
     MAX_NAME_LENGTH = 70
     MAX_ITEM_ID_LENGTH = 35
     MAX_TEXT_LENGTH = 350
+    MAX_DECIMAL_PLACES = 6
     SEGMENT_TERMINATOR = "'"
     DATA_ELEMENT_SEPARATOR = "+"
     COMPONENT_SEPARATOR = ":"
@@ -52,6 +122,8 @@ class EDIFACTConfig:
     DEFAULT_PRECISION = 2
     DEFAULT_VERSION = "D"
     DEFAULT_RELEASE = "96A"
+    MAX_FILE_SIZE_MB = 10
+    MAX_RETRIES = 3
     
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -60,7 +132,7 @@ class EDIFACTConfig:
 
 class EDIFACTValidator:
     @classmethod
-    def validate_schema(cls, data: Dict[str, Any]) -> None:
+    def validate_schema(cls, data: InvoiceDict) -> None:
         required_fields = ["invoice_number", "invoice_date", "currency", "parties", "items"]
         
         for field in required_fields:
@@ -144,27 +216,32 @@ class EDIFACTValidator:
             )
 
     @classmethod
-    def validate_fields(cls, data: Dict[str, Any], config: EDIFACTConfig) -> None:
+    def validate_fields(cls, data: InvoiceDict, config: EDIFACTConfig) -> None:
         if data.get("charset") and data["charset"] not in config.SUPPORTED_CHARSETS:
             raise EDIFACTValidationError(f"Unsupported charset: {data['charset']}", "VALID_002")
         
         if data["currency"] not in config.SUPPORTED_CURRENCIES:
             raise EDIFACTValidationError(f"Unsupported currency: {data['currency']}", "VALID_003")
         
-        cls._validate_date(data["invoice_date"], "invoice_date", "102")
+        cls._validate_date(data["invoice_date"], "invoice_date")
         if data.get("due_date"):
-            cls._validate_date(data["due_date"], "due_date", "102")
+            cls._validate_date(data["due_date"], "due_date")
+        if data.get("payment_due_date"):
+            cls._validate_date(data["payment_due_date"], "payment_due_date")
+        
+        if data.get("payment_terms"):
+            cls._validate_payment_terms(data["payment_terms"], config)
         
         for party in ("buyer", "seller"):
             cls._validate_party(data["parties"][party], party, config)
         
         for idx, item in enumerate(data["items"]):
-            cls._validate_item(item, idx)
+            cls._validate_item(item, idx, config)
         
         cls._validate_interdependencies(data)
 
     @classmethod
-    def _validate_date(cls, date_str: str, field_name: str, date_format: str) -> None:
+    def _validate_date(cls, date_str: str, field_name: str, date_format: str = "102") -> None:
         fmt = DATE_FORMATS.get(date_format)
         if not fmt:
             raise EDIFACTValidationError(f"Unsupported date format: {date_format}", "VALID_004")
@@ -175,7 +252,16 @@ class EDIFACTValidator:
             raise EDIFACTValidationError(f"Invalid date in {field_name}: {date_str}", "VALID_005")
 
     @classmethod
-    def _validate_party(cls, party: Dict[str, Any], role: str, config: EDIFACTConfig) -> None:
+    def _validate_payment_terms(cls, terms: str, config: EDIFACTConfig) -> None:
+        if terms not in config.SUPPORTED_PAYMENT_TERMS:
+            raise EDIFACTValidationError(
+                f"Unsupported payment terms: {terms}",
+                "VALID_014",
+                {"supported_terms": list(config.SUPPORTED_PAYMENT_TERMS)}
+            )
+
+    @classmethod
+    def _validate_party(cls, party: PartyDict, role: str, config: EDIFACTConfig) -> None:
         if not party.get("id"):
             raise EDIFACTValidationError(f"{role} ID is required", "VALID_006")
         
@@ -194,10 +280,10 @@ class EDIFACTValidator:
             )
 
     @classmethod
-    def _validate_item(cls, item: Dict[str, Any], index: int) -> None:
-        if len(item["id"]) > EDIFACTConfig.MAX_ITEM_ID_LENGTH:
+    def _validate_item(cls, item: ItemDict, index: int, config: EDIFACTConfig) -> None:
+        if len(item["id"]) > config.MAX_ITEM_ID_LENGTH:
             raise EDIFACTValidationError(
-                f"Item {index} ID too long: {len(item['id'])} > {EDIFACTConfig.MAX_ITEM_ID_LENGTH}",
+                f"Item {index} ID too long: {len(item['id'])} > {config.MAX_ITEM_ID_LENGTH}",
                 "VALID_009",
                 {"item_index": index, "length": len(item["id"])}
             )
@@ -207,7 +293,7 @@ class EDIFACTValidator:
             raise EDIFACTValidationError(
                 f"Item {index} quantity must be positive",
                 "VALID_010",
-                {"item_index": index, "quantity": item["quantity"]}
+                {"item_index": index, "quantity": str(item["quantity"])}
             )
         
         price = Decimal(str(item["price"]))
@@ -215,23 +301,29 @@ class EDIFACTValidator:
             raise EDIFACTValidationError(
                 f"Item {index} price must be non-negative",
                 "VALID_011",
-                {"item_index": index, "price": item["price"]}
+                {"item_index": index, "price": str(item["price"])}
             )
 
     @classmethod
-    def _validate_interdependencies(cls, data: Dict[str, Any]) -> None:
+    def _validate_interdependencies(cls, data: InvoiceDict) -> None:
         if data.get("due_date"):
             invoice_date = datetime.strptime(data["invoice_date"], "%Y%m%d")
             due_date = datetime.strptime(data["due_date"], "%Y%m%d")
             if due_date <= invoice_date:
                 raise EDIFACTValidationError("Due date must be after invoice date", "VALID_012")
         
+        if data.get("payment_due_date") and data.get("due_date"):
+            payment_due_date = datetime.strptime(data["payment_due_date"], "%Y%m%d")
+            due_date = datetime.strptime(data["due_date"], "%Y%m%d")
+            if payment_due_date < due_date:
+                raise EDIFACTValidationError("Payment due date cannot be before due date", "VALID_015")
+        
         item_ids = [item["id"] for item in data["items"]]
         if len(item_ids) != len(set(item_ids)):
             raise EDIFACTValidationError("Item IDs must be unique", "VALID_013")
 
 class EDIFACTGenerator:
-    def __init__(self, data: Dict[str, Any], config: Optional[EDIFACTConfig] = None, line_ending: str = "\n"):
+    def __init__(self, data: InvoiceDict, config: Optional[EDIFACTConfig] = None, line_ending: str = "\n"):
         self.data = self._sanitize_input(data)
         self.config = config or EDIFACTConfig()
         self.line_ending = line_ending
@@ -240,18 +332,15 @@ class EDIFACTGenerator:
         self.segments: List[str] = []
         self._generated = False
 
-    def _sanitize_input(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized = {}
-        for key, value in data.items():
-            if isinstance(value, str):
-                sanitized[key] = CONTROL_CHAR_REGEX.sub('', value)
-            elif isinstance(value, dict):
-                sanitized[key] = self._sanitize_input(value)
-            elif isinstance(value, list):
-                sanitized[key] = [self._sanitize_input(item) if isinstance(item, dict) else item for item in value]
-            else:
-                sanitized[key] = value
-        return sanitized
+    def _sanitize_input(self, data: Any) -> Any:
+        if isinstance(data, str):
+            return CONTROL_CHAR_REGEX.sub('', data)
+        elif isinstance(data, dict):
+            return {key: self._sanitize_input(value) for key, value in data.items()}
+        elif isinstance(data, list):
+            return [self._sanitize_input(item) for item in data]
+        else:
+            return data
 
     def _format_decimal(self, value: Any) -> str:
         try:
@@ -260,9 +349,17 @@ class EDIFACTGenerator:
             else:
                 d = Decimal(value)
             
-            quantized = d.quantize(Decimal(f"1.{'0'*self.config.DEFAULT_PRECISION}"), rounding=ROUND_HALF_UP)
+            decimal_places = self.config.DEFAULT_PRECISION
+            if len(str(d).split('.')[-1]) > self.config.MAX_DECIMAL_PLACES:
+                raise EDIFACTGenerationError(
+                    f"Too many decimal places in {value}",
+                    "GEN_007",
+                    {"max_allowed": self.config.MAX_DECIMAL_PLACES}
+                )
             
-            formatted = f"{quantized:.{self.config.DEFAULT_PRECISION}f}"
+            quantized = d.quantize(Decimal(f"1.{'0'*decimal_places}"), rounding=ROUND_HALF_UP)
+            
+            formatted = f"{quantized:.{decimal_places}f}"
             
             if self.data.get("charset") in ["UNOA", "UNOB"]:
                 formatted = formatted.replace('.', ',')
@@ -332,26 +429,35 @@ class EDIFACTGenerator:
         agreement_id = self.data.get("agreement_id", "")
         test_indicator = self.data.get("test_indicator", "1")
         
-        self.segments.append(
-            self._build_segment("UNB", [
-                f"{charset}:{version}",
-                sender_id,
-                receiver_id,
-                timestamp,
-                self.interchange_ref,
-                application_ref,
-                priority,
-                ack_request,
-                agreement_id,
-                test_indicator
-            ])
-        )
+        unb_elements = [
+            f"{charset}:{version}",
+            sender_id,
+            receiver_id,
+            timestamp,
+            self.interchange_ref
+        ]
+        
+        if application_ref:
+            unb_elements.append(application_ref)
+        if priority:
+            unb_elements.append(priority)
+        if ack_request:
+            unb_elements.append(ack_request)
+        if agreement_id:
+            unb_elements.append(agreement_id)
+        if test_indicator:
+            unb_elements.append(test_indicator)
+        
+        self.segments.append(self._build_segment("UNB", unb_elements))
 
     def _add_unz_segment(self) -> None:
-        group_count = "1"
+        group_count = str(len([s for s in self.segments if s.startswith("UNH+")]))
         self.segments.append(self._build_segment("UNZ", [group_count, self.interchange_ref]))
 
     def _add_header_segments(self) -> None:
+        if "currency" not in self.data:
+            raise EDIFACTGenerationError("Currency is required for header segments", "GEN_008")
+        
         self.segments.append(
             self._build_segment("UNH", [
                 self.message_ref, 
@@ -359,15 +465,15 @@ class EDIFACTGenerator:
             ])
         )
         self.segments.append(
-            self._build_segment("BGM", ["380", self.data["invoice_number"], "9"])
+            self._build_segment("BGM", [SEGMENT_CODES["INVOICE_TYPE"], self.data["invoice_number"], "9"])
         )
         self.segments.append(
-            self._build_segment("DTM", ["137", self.data["invoice_date"], "102"])
+            self._build_segment("DTM", [SEGMENT_CODES["DATE_ISSUED"], self.data["invoice_date"], "102"])
         )
         
         if self.data.get("due_date"):
             self.segments.append(
-                self._build_segment("DTM", ["13", self.data["due_date"], "102"])
+                self._build_segment("DTM", [SEGMENT_CODES["DATE_DUE"], self.data["due_date"], "102"])
             )
         
         if self.data.get("payment_terms"):
@@ -377,35 +483,50 @@ class EDIFACTGenerator:
             
             if self.data.get("payment_due_date"):
                 self.segments.append(
-                    self._build_segment("DTM", ["12", self.data["payment_due_date"], "102"])
+                    self._build_segment("DTM", [SEGMENT_CODES["DATE_PAYMENT_DUE"], self.data["payment_due_date"], "102"])
                 )
 
     def _add_currency_segment(self) -> None:
+        if "currency" not in self.data:
+            raise EDIFACTGenerationError("Currency is required for CUX segment", "GEN_009")
+        
         self.segments.append(
-            self._build_segment("CUX", ["2", self.data["currency"], "9"])
+            self._build_segment("CUX", [SEGMENT_CODES["CURRENCY_INVOICE"], self.data["currency"], "9"])
         )
 
     def _add_party_segments(self) -> None:
-        for role, code in {"buyer": "BY", "seller": "SE"}.items():
+        party_mapping = {"buyer": SEGMENT_CODES["PARTY_BUYER"], "seller": SEGMENT_CODES["PARTY_SELLER"]}
+        
+        for role, code in party_mapping.items():
+            if role not in self.data["parties"]:
+                raise EDIFACTGenerationError(f"Missing {role} party data", "GEN_010", {"role": role})
+            
             party = self.data["parties"][role]
+            communication_type = SEGMENT_CODES["COMMUNICATION_TELEPHONE"]
+            if party.get("contact") and "@" in party["contact"]:
+                communication_type = SEGMENT_CODES["COMMUNICATION_EMAIL"]
+            
             self.segments.append(
                 self._build_segment("NAD", [code, party["id"], "", "91", party.get("name", "")])
             )
             
             if party.get("address"):
                 self.segments.append(
-                    self._build_segment("LOC", ["11", party["address"]])
+                    self._build_segment("LOC", [SEGMENT_CODES["LOCATION_PLACE"], party["address"]])
                 )
             
             if party.get("contact"):
                 self.segments.append(
-                    self._build_segment("COM", [party["contact"], "TE"])
+                    self._build_segment("COM", [party["contact"], communication_type])
                 )
 
     def _add_line_items(self) -> None:
+        if len(self.data["items"]) > 999999:
+            raise EDIFACTGenerationError("Too many line items", "GEN_011", {"count": len(self.data["items"])})
+        
         for idx, item in enumerate(self.data["items"], start=1):
             self.segments.append(
-                self._build_segment("LIN", [str(idx), "", item["id"], "EN"])
+                self._build_segment("LIN", [str(idx), "", item["id"], SEGMENT_CODES["ITEM_IDENTIFICATION"]])
             )
             
             if item.get("description"):
@@ -415,17 +536,16 @@ class EDIFACTGenerator:
             
             unit = item.get("unit", "PCE")
             self.segments.append(
-                self._build_segment("QTY", ["47", self._format_decimal(item["quantity"]), unit])
+                self._build_segment("QTY", [SEGMENT_CODES["QUALIFIER_ORDERED"], self._format_decimal(item["quantity"]), unit])
             )
             
             self.segments.append(
-                self._build_segment("PRI", ["AAA", self._format_decimal(item["price"]), unit])
+                self._build_segment("PRI", [SEGMENT_CODES["PRICE_NET"], self._format_decimal(item["price"]), unit])
             )
             
             if item.get("tax_category"):
-                self.segments.append(
-                    self._build_segment("TAX", ["7", item["tax_category"], "", "", "", "", ""])
-                )
+                tax_elements = [SEGMENT_CODES["TAX_SERVICE"], item["tax_category"], "", "", "", "", ""]
+                self.segments.append(self._build_segment("TAX", tax_elements))
 
     def _add_ftx_segments(self) -> None:
         if self.data.get("notes"):
@@ -434,7 +554,7 @@ class EDIFACTGenerator:
             chunks = [notes[i:i+max_length] for i in range(0, len(notes), max_length)]
             for i, chunk in enumerate(chunks, 1):
                 self.segments.append(
-                    self._build_segment("FTX", ["AAI", str(i), "", "", chunk])
+                    self._build_segment("FTX", [SEGMENT_CODES["FTX_TEXT"], str(i), "", "", chunk])
                 )
 
     def _add_payment_instructions(self) -> None:
@@ -442,7 +562,11 @@ class EDIFACTGenerator:
             bank_data = self.data["bank_account"]
             if bank_data.get("account") and bank_data.get("bank_code"):
                 self.segments.append(
-                    self._build_segment("FII", ["BE", "", bank_data.get("account"), "", bank_data.get("bank_code")])
+                    self._build_segment("FII", [SEGMENT_CODES["FII_ACCOUNT"], "", bank_data["account"], "", bank_data["bank_code"]])
+                )
+            elif bank_data.get("account"):
+                self.segments.append(
+                    self._build_segment("FII", [SEGMENT_CODES["FII_ACCOUNT"], "", bank_data["account"]])
                 )
 
     def _add_summary_segments(self) -> None:
@@ -455,7 +579,7 @@ class EDIFACTGenerator:
         subtotal_quantized = subtotal.quantize(Decimal(f"1.{'0'*self.config.DEFAULT_PRECISION}"), rounding=ROUND_HALF_UP)
         
         self.segments.append(
-            self._build_segment("MOA", ["79", self._format_decimal(subtotal_quantized)])
+            self._build_segment("MOA", [SEGMENT_CODES["MOA_LINE_TOTAL"], self._format_decimal(subtotal_quantized)])
         )
         
         if self.data.get("tax_rate"):
@@ -463,19 +587,18 @@ class EDIFACTGenerator:
             tax_amount = (subtotal * tax_rate / Decimal("100")).quantize(
                 Decimal(f"1.{'0'*self.config.DEFAULT_PRECISION}"), rounding=ROUND_HALF_UP
             )
+            tax_elements = [SEGMENT_CODES["TAX_SERVICE"], SEGMENT_CODES["TAX_VAT"], "", "", "", "", self._format_decimal(tax_rate)]
+            self.segments.append(self._build_segment("TAX", tax_elements))
             self.segments.append(
-                self._build_segment("TAX", ["7", "VAT", "", "", "", "", self._format_decimal(tax_rate)])
-            )
-            self.segments.append(
-                self._build_segment("MOA", ["124", self._format_decimal(tax_amount)])
+                self._build_segment("MOA", [SEGMENT_CODES["MOA_TAX_TOTAL"], self._format_decimal(tax_amount)])
             )
             total_amount = subtotal_quantized + tax_amount
             self.segments.append(
-                self._build_segment("MOA", ["86", self._format_decimal(total_amount)])
+                self._build_segment("MOA", [SEGMENT_CODES["MOA_INVOICE_TOTAL"], self._format_decimal(total_amount)])
             )
         else:
             self.segments.append(
-                self._build_segment("MOA", ["86", self._format_decimal(subtotal_quantized)])
+                self._build_segment("MOA", [SEGMENT_CODES["MOA_INVOICE_TOTAL"], self._format_decimal(subtotal_quantized)])
             )
 
     def _add_unt_segment(self) -> None:
@@ -484,7 +607,7 @@ class EDIFACTGenerator:
             raise EDIFACTGenerationError("UNH segment not found", "GEN_005")
         
         unh_index = unh_indices[0]
-        segment_count = len(self.segments) - unh_index + 1
+        segment_count = len(self.segments) - unh_index
         self.segments.append(
             self._build_segment("UNT", [str(segment_count), self.message_ref])
         )
@@ -514,7 +637,14 @@ class EDIFACTGenerator:
 
         edifact_content = self.line_ending.join(self.segments)
         
-        logger.debug(f"Generated {len(self.segments)} segments")
+        content_size_mb = len(edifact_content.encode('utf-8')) / (1024 * 1024)
+        if content_size_mb > self.config.MAX_FILE_SIZE_MB:
+            raise EDIFACTGenerationError(
+                f"Generated content too large: {content_size_mb:.2f}MB > {self.config.MAX_FILE_SIZE_MB}MB",
+                "GEN_012"
+            )
+        
+        logger.debug(f"Generated {len(self.segments)} segments, size: {content_size_mb:.2f}MB")
         
         if not self.validate_edifact_syntax(edifact_content):
             raise EDIFACTGenerationError("Generated EDIFACT content failed syntax validation", "GEN_006")
@@ -548,32 +678,41 @@ class EDIFACTGenerator:
         
         return True
 
-    def _validate_file_path(self, filename: str) -> None:
+    def _validate_file_path(self, filename: str, create_dirs: bool = False) -> None:
         if not filename:
             return
         
         if '/' in filename or '\\' in filename:
             directory = os.path.dirname(filename)
-            if directory:
+            if directory and create_dirs:
                 os.makedirs(directory, exist_ok=True)
+            elif directory and not os.path.exists(directory):
+                raise EDIFACTGenerationError(
+                    f"Directory does not exist: {directory}",
+                    "IO_004",
+                    {"create_dirs_option": "Set create_dirs=True to create automatically"}
+                )
         
         if not filename.lower().endswith(('.edi', '.edifact')):
             logger.warning("Recommended file extension is .edi or .edifact")
 
-    def save_to_file(self, filename: Optional[str] = None) -> str:
+    def save_to_file(self, filename: Optional[str] = None, create_dirs: bool = False, max_retries: int = 3) -> str:
         message = self.generate()
         if not filename:
             filename = f"invoice_{self.data['invoice_number']}.edi"
         
-        self._validate_file_path(filename)
+        self._validate_file_path(filename, create_dirs)
         
-        try:
-            with open(filename, "w", encoding="utf-8", newline="") as f:
-                f.write(message)
-            logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
-            return filename
-        except IOError as e:
-            raise EDIFACTGenerationError(f"Failed to write file: {e}", "IO_002")
+        for attempt in range(max_retries):
+            try:
+                with open(filename, "w", encoding="utf-8", newline="") as f:
+                    f.write(message)
+                logger.info(f"EDIFACT INVOIC saved to {os.path.abspath(filename)}")
+                return filename
+            except IOError as e:
+                if attempt == max_retries - 1:
+                    raise EDIFACTGenerationError(f"Failed to write file after {max_retries} attempts: {e}", "IO_002")
+                time.sleep(1)
 
     @classmethod
     def from_json_file(cls, filepath: str, **kwargs) -> 'EDIFACTGenerator':
@@ -584,11 +723,18 @@ class EDIFACTGenerator:
         except (IOError, json.JSONDecodeError) as e:
             raise EDIFACTGenerationError(f"Failed to load JSON file: {e}", "IO_003")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> InvoiceDict:
         return self.data.copy()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._generated and exc_type is None:
+            self.generate()
+
 if __name__ == "__main__":
-    example_invoice = {
+    example_invoice: InvoiceDict = {
         "invoice_number": "INV12345",
         "invoice_date": "20250509",
         "due_date": "20250609",
@@ -642,13 +788,13 @@ if __name__ == "__main__":
 
     try:
         config = EDIFACTConfig(DEFAULT_PRECISION=2)
-        generator = EDIFACTGenerator(example_invoice, config=config, line_ending="\r\n")
-        filepath = generator.save_to_file()
-        print(f"EDIFACT file generated: {filepath}")
-        
-        with open(filepath, 'r') as f:
-            print("\nGenerated EDIFACT content:")
-            print(f.read())
+        with EDIFACTGenerator(example_invoice, config=config, line_ending="\r\n") as generator:
+            filepath = generator.save_to_file(create_dirs=True)
+            print(f"EDIFACT file generated: {filepath}")
+            
+            with open(filepath, 'r') as f:
+                print("\nGenerated EDIFACT content:")
+                print(f.read())
             
     except EDIFACTBaseError as e:
         logger.error(f"EDIFACT generation failed: {e}")
